@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+
+# Build artifacts
+geocontext_qgis.zip
+
+# QGIS scratch
+*.qgz~
+*.qgs~
+
+# Editor / tool dirs
+.claude/
+.vscode/
+.idea/
+
+# Local sample referenced from chat — don't ship by default
+gcx.json
