@@ -16,7 +16,7 @@ from .local_sync import save_to_folder
 
 
 LOG_TAG = "GeoContext Sync"
-MENU = "&GeoContext Sync"
+MENU = "&OpenHistoryMap"
 
 
 class GeoContextSyncPlugin:
