@@ -5,6 +5,7 @@ import math
 import os
 import re
 from collections import OrderedDict
+from urllib.parse import unquote
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
@@ -20,6 +21,13 @@ from qgis.core import (
 
 GCX_FILENAME = "gcx.json"
 DATASETS_DIR = "datasets"
+
+# Built-in XYZ basemap URL templates we recognise so the exported gcx.json
+# uses a short alias (`"background": "osm"`) instead of the raw URL.
+_BACKGROUND_ALIAS_BY_HOST = {
+    "tile.openstreetmap.org": "osm",
+    "tiles.openfantasymaps.org": "ofm",
+}
 
 # Slippy-map zoom calibration: scale denominator at zoom 0 at the equator,
 # 256-px tiles, 96 DPI. The same constant Leaflet/Mapbox use.
@@ -114,6 +122,67 @@ def _style_for_layer(layer):
     ])
 
 
+def _xyz_url_from_raster(layer):
+    """Pull an `{z}/{x}/{y}` URL template out of a QGIS XYZ raster layer's
+    datasource string. Returns None for raster layers that aren't XYZ
+    (WMS proper, GeoPackage rasters, local TIFFs, …)."""
+    if layer.type() != QgsMapLayer.RasterLayer:
+        return None
+    if (layer.providerType() or "").lower() != "wms":
+        return None
+    uri = layer.dataProvider().dataSourceUri() if layer.dataProvider() else ""
+    parts = dict(p.split("=", 1) for p in uri.split("&") if "=" in p)
+    if parts.get("type", "").lower() != "xyz":
+        return None
+    raw = parts.get("url")
+    if not raw:
+        return None
+    return unquote(raw)
+
+
+def _detect_background(layer_tree_root):
+    """Find the topmost XYZ raster basemap in the QGIS layer tree and
+    convert it to a `background` value. Returns either:
+
+    - a short alias string (`"osm"`, `"ofm"`) when the URL matches a
+      known provider, so the exported config stays terse; or
+    - an OrderedDict `{ "url": ..., "attribution": ... }` for arbitrary
+      tile services; or
+    - None when no XYZ basemap is in the project (the frontend will use
+      its default style).
+    """
+    for node in layer_tree_root.findLayers():
+        layer = node.layer()
+        if layer is None:
+            continue
+        url = _xyz_url_from_raster(layer)
+        if not url:
+            continue
+        for host, alias in _BACKGROUND_ALIAS_BY_HOST.items():
+            if host in url:
+                return alias
+        spec = OrderedDict([("url", url)])
+        attribution = layer.attribution() if hasattr(layer, "attribution") else ""
+        if attribution:
+            spec["attribution"] = attribution
+        return spec
+    return None
+
+
+def _is_interactive(layer):
+    """Map QGIS's per-layer `Identifiable` flag to gcx's `interactive`
+    field. A layer the user marked non-identifiable in QGIS (Layer →
+    Properties → Rendering → "Identifiable") is exported as visual
+    context only — no popup, no click handler in the frontend."""
+    flags_attr = getattr(layer, "flags", None)
+    if not callable(flags_attr):
+        return True
+    try:
+        return bool(flags_attr() & QgsMapLayer.Identifiable)
+    except (AttributeError, TypeError):
+        return True
+
+
 def _project_title():
     project = QgsProject.instance()
     if project.title():
@@ -197,12 +266,19 @@ def build_snapshot(iface, output_dir, geojson_crs="EPSG:4326",
             ("conf", OrderedDict([("source", rel_path)])),
         ]))
 
-        layers_meta.append(OrderedDict([
+        entry = OrderedDict([
             ("name", slug),
             ("type", "features"),
             ("datasource", slug),
-            ("style", _style_for_layer(layer)),
-        ]))
+        ])
+        # QGIS's `Identifiable` flag is the user's existing way of saying
+        # "this layer is context, don't probe it" — we surface that intent
+        # in gcx as `"interactive": false`. Only emit when explicitly off
+        # so default exports stay clean.
+        if not _is_interactive(layer):
+            entry["interactive"] = False
+        entry["style"] = _style_for_layer(layer)
+        layers_meta.append(entry)
 
     snapshot = OrderedDict([
         ("title", _project_title()),
@@ -211,7 +287,10 @@ def build_snapshot(iface, output_dir, geojson_crs="EPSG:4326",
         ("minzoom", minzoom),
         ("startzoom", startzoom),
         ("maxzoom", maxzoom),
-        ("datasources", datasources),
-        ("layers", layers_meta),
     ])
+    background = _detect_background(layer_tree_root)
+    if background is not None:
+        snapshot["background"] = background
+    snapshot["datasources"] = datasources
+    snapshot["layers"] = layers_meta
     return snapshot, files_to_upload
